@@ -1,0 +1,21 @@
+# Model weights and checkpoints
+models/
+checkpoints/
+
+# Training artifacts
+train.log
+workspace/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data (large files)
+data/seta-env/
+
+# SGLang storage
+sglang_storage/
+terminal_logs/
+
+# Claude
+.claude/
