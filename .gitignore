@@ -17,5 +17,8 @@ data/seta-env/
 sglang_storage/
 terminal_logs/
 
+# Wandb local runs
+wandb/
+
 # Claude
 .claude/

@@ -11,6 +11,7 @@ from slime.utils.types import Sample
 
 _build_locks: dict[str, threading.Lock] = {}
 _build_locks_mutex = threading.Lock()
+_logged_full_rollout = False
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,20 @@ async def generate(args, sample: Sample, sampling_params:dict) -> Sample:
     task_path = sample.metadata.get("task_path")
 
     loop = asyncio.get_event_loop()
-    container = await loop.run_in_executor(None, lambda: _start_container(task_path))
+    try:
+        container = await loop.run_in_executor(None, lambda: _start_container(task_path))
+    except Exception as e:
+        logger.warning("Failed to start container for %s: %s", task_path, e)
+        sample.status = Sample.Status.ABORTED
+        sample.metadata["pass_ratio"] = 0.0
+        sample.reward = {"score": 0.0}
+        sample.remove_sample = True
+        sample.tokens = state.tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
+        sample.response_length = 0
+        sample.response = ""
+        sample.loss_mask = []
+        sample.rollout_log_probs = []
+        return sample
     toolkit = TerminalToolkit(use_docker_backend=True, docker_container_name=container.id, safe_mode=False)
 
     # Get tool schemas and build prompt
@@ -75,6 +89,31 @@ async def generate(args, sample: Sample, sampling_params:dict) -> Sample:
         tools=tool_schemas,
     )
     prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+
+    # Pre-tokenize chat turn boundary markers (Qwen3.5 format)
+    im_end_ids = state.tokenizer("<|im_end|>", add_special_tokens=False)["input_ids"]
+    im_end_id = im_end_ids[0] if im_end_ids else None
+    boundary_before_obs = state.tokenizer("\n<|im_start|>user\n", add_special_tokens=False)["input_ids"]
+    boundary_after_obs = state.tokenizer("<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False)["input_ids"]
+
+    def _append_non_trainable(token_ids):
+        """Append tokens with loss_mask=0 (observations, turn boundaries)."""
+        response_token_ids.extend(token_ids)
+        loss_masks.extend([0] * len(token_ids))
+        rollout_log_probs.extend([0.0] * len(token_ids))
+
+    def _append_observation(observation_text):
+        """Wrap observation in proper Qwen3.5 chat turn boundaries and append."""
+        # Ensure previous model output ends with <|im_end|>
+        if im_end_id is not None and response_token_ids and response_token_ids[-1] != im_end_id:
+            _append_non_trainable(im_end_ids)
+        # <|im_end|>\n<|im_start|>user\n
+        _append_non_trainable(boundary_before_obs)
+        # observation content
+        obs_ids = state.tokenizer(observation_text, add_special_tokens=False)["input_ids"]
+        _append_non_trainable(obs_ids)
+        # <|im_end|>\n<|im_start|>assistant\n
+        _append_non_trainable(boundary_after_obs)
 
     # Initialize token tracking
     response_token_ids = []
@@ -142,12 +181,9 @@ async def generate(args, sample: Sample, sampling_params:dict) -> Sample:
                 observation = (
                     "<tool_response>\nerror: no tool call found in your response. "
                     "Please use the <tool_call>{...}</tool_call> format to call a tool, "
-                    "or finish your answer if the task is complete.\n</tool_response>\n"
+                    "or finish your answer if the task is complete.\n</tool_response>"
                 )
-                obs_token_ids = state.tokenizer(observation, add_special_tokens=False)["input_ids"]
-                response_token_ids.extend(obs_token_ids)
-                loss_masks.extend([0] * len(obs_token_ids))
-                rollout_log_probs.extend([0.0] * len(obs_token_ids))
+                _append_observation(observation)
                 continue
 
             try:
@@ -158,33 +194,27 @@ async def generate(args, sample: Sample, sampling_params:dict) -> Sample:
                 # Malformed JSON — feed error back and let the model retry
                 observation = (
                     f"<tool_response>\nerror: could not parse tool call JSON: {e}. "
-                    f"Please ensure your tool call is valid JSON inside <tool_call></tool_call> tags.\n</tool_response>\n"
+                    f"Please ensure your tool call is valid JSON inside <tool_call></tool_call> tags.\n</tool_response>"
                 )
-                obs_token_ids = state.tokenizer(observation, add_special_tokens=False)["input_ids"]
-                response_token_ids.extend(obs_token_ids)
-                loss_masks.extend([0] * len(obs_token_ids))
-                rollout_log_probs.extend([0.0] * len(obs_token_ids))
+                _append_observation(observation)
                 continue
 
             # Step 4: Execute tool via CAMEL toolkit
             tool_method = getattr(toolkit, tool_name, None)
             if tool_method is None:
-                observation = f"<tool_response>\nerror: unknown tool '{tool_name}'\n</tool_response>\n"
+                observation = f"<tool_response>\nerror: unknown tool '{tool_name}'\n</tool_response>"
             else:
                 try:
                     result = await loop.run_in_executor(None, lambda: tool_method(**tool_args))
-                    observation = f"<tool_response>\n{result}\n</tool_response>\n"
+                    observation = f"<tool_response>\n{result}\n</tool_response>"
                 except Exception as e:
                     observation = (
                         f"<tool_response>\nerror calling {tool_name}: {e}\n"
-                        f"</tool_response>\n"
+                        f"</tool_response>"
                     )
 
-            # Step 5: Append observation — non-trainable (loss_mask=0)
-            obs_token_ids = state.tokenizer(observation, add_special_tokens=False)["input_ids"]
-            response_token_ids.extend(obs_token_ids)
-            loss_masks.extend([0] * len(obs_token_ids))
-            rollout_log_probs.extend([0.0] * len(obs_token_ids))
+            # Step 5: Append observation with proper chat turn boundaries
+            _append_observation(observation)
 
         # Run tests and record pass ratio.
         # Skip if the episode was cut short — the agent didn't finish the task.
@@ -214,6 +244,47 @@ async def generate(args, sample: Sample, sampling_params:dict) -> Sample:
 
     if sample.status == Sample.Status.PENDING:
         sample.status = Sample.Status.COMPLETED
+
+    sample.metadata["turn_count"] = turn + 1 if 'turn' in dir() else 0
+    logger.info(
+        "episode done | task=%s | status=%s | turns=%d | pass_ratio=%.3f | response_len=%d",
+        task_path, sample.status, sample.metadata.get("turn_count", 0),
+        sample.metadata.get("pass_ratio", 0.0), sample.response_length,
+    )
+
+    # Log one full rollout for debugging token/mask alignment
+    global _logged_full_rollout
+    if not _logged_full_rollout:
+        _logged_full_rollout = True
+        full_text = state.tokenizer.decode(sample.tokens)
+        # Build annotated view: mark each token with its loss_mask value
+        prompt_len = len(prompt_token_ids)
+        all_ids = sample.tokens
+        masks = [0] * prompt_len + loss_masks
+        annotated_lines = []
+        # Walk through tokens and show boundaries where mask changes
+        current_mask = None
+        current_chunk = []
+        for i, (tid, m) in enumerate(zip(all_ids, masks)):
+            if m != current_mask:
+                if current_chunk:
+                    chunk_text = state.tokenizer.decode(current_chunk)
+                    annotated_lines.append(f"[mask={current_mask}] {chunk_text}")
+                current_mask = m
+                current_chunk = []
+            current_chunk.append(tid)
+        if current_chunk:
+            chunk_text = state.tokenizer.decode(current_chunk)
+            annotated_lines.append(f"[mask={current_mask}] {chunk_text}")
+        annotated = "\n---\n".join(annotated_lines)
+        logger.info(
+            "\n========== FULL ROLLOUT DEBUG (first episode) ==========\n"
+            "task: %s | tokens: %d | prompt: %d | response: %d | masks: %d\n"
+            "--- ANNOTATED (mask=0: non-trainable, mask=1: trainable) ---\n%s\n"
+            "========== END ROLLOUT DEBUG ==========",
+            task_path, len(all_ids), prompt_len, len(response_token_ids),
+            len(masks), annotated,
+        )
 
     return sample
 
@@ -282,17 +353,23 @@ def _run_tests(container, task_path: str) -> float:
         os.path.join(task_path, "tests"), "/tests"
     )
 
-    # Make run-tests.sh executable and run it; capture output
+    # Make run-tests.sh executable and run it from a clean temp dir
+    # to avoid conflicts with any existing pyproject.toml in the task WORKDIR.
     container.exec_run("chmod +x /run-tests.sh")
+    container.exec_run("mkdir -p /tmp/test-runner")
     _, output = container.exec_run(
         "bash /run-tests.sh",
-        environment={"TEST_DIR": "/tests"},
-        workdir="/",
+        environment={"TEST_DIR": "/tests", "HOME": "/root"},
+        workdir="/tmp/test-runner",
+        user="root",
     )
     stdout = output.decode("utf-8", errors="replace")
     logger.debug("Test output:\n%s", stdout)
 
-    return _parse_pytest_ratio(stdout)
+    ratio = _parse_pytest_ratio(stdout)
+    if ratio == 0.0:
+        logger.info("test output tail [%s]: %s", task_path, stdout[-300:].replace('\n', ' | '))
+    return ratio
 
 
 def _parse_pytest_ratio(output: str) -> float:
@@ -314,6 +391,9 @@ def _parse_pytest_ratio(output: str) -> float:
 
     total = passed + failed + error
     if total == 0:
-        logger.warning("Could not parse pytest output, defaulting pass_ratio=0")
+        if "no tests ran" in output or "collected 0 items" in output:
+            logger.debug("No tests collected, pass_ratio=0")
+        else:
+            logger.warning("Could not parse pytest output, defaulting pass_ratio=0. Output tail: %s", output[-200:])
         return 0.0
     return passed / total

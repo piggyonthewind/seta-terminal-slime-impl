@@ -38,15 +38,15 @@ ROLLOUT_ARGS=(
     --input-key text
     --rollout-shuffle
     --reward-key score
-    --num-rollout 32
-    --rollout-batch-size 4
-    --n-samples-per-prompt 8
-    --rollout-max-response-len 8192
+    --num-rollout 1
+    --rollout-batch-size 1
+    --n-samples-per-prompt 1
+    --rollout-max-response-len 4096
     --rollout-temperature 1.0
-    --max-agent-turns 20
-    --rollout-max-context-len 16384
+    --max-agent-turns 5
+    --rollout-max-context-len 8192
 
-    --global-batch-size 32
+    --global-batch-size 1
     --balance-data
 )
 
@@ -105,7 +105,7 @@ MISC_ARGS=(
 WANDB_ARGS=(
     --use-wandb
     --wandb-project seta-qwen3.5-9b-a100
-    --wandb-group seta-train
+    --wandb-group seta-test
 )
 
 CUSTOM_ARGS=(
